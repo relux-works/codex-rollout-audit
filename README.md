@@ -20,6 +20,29 @@ python3 codex_rollout_audit.py session ~/.codex/sessions/2026/09/10/rollout-...j
 Every subcommand accepts one or more directories or files; the default is
 `~/.codex/sessions`. If you archive rollouts elsewhere, pass those paths.
 
+## Start here
+
+Run `summary` first. Every subcommand now opens with a `VERDICT` block in
+plain words, followed by the data it was computed from. A typical result on a
+subscription account looks like this:
+
+```
+VERDICT
+  274 sessions, 9.43B input tokens, 98% of them cache hits.
+  3 sessions (1.1%) had goal mode on and used 71% of all input tokens.
+  20 goal turns did nothing but poll: 3 hours, 0.17B tokens,
+  about 65M input tokens per hour of waiting.
+  For scale: waiting on a notification costs roughly 0.5M per hour at the same context.
+  This is the pattern from the post: a few goal sessions eating most of the budget.
+  Float-argument rejections: 0. Expected for OpenAI models; see `floatbug`.
+```
+
+If you never turned goal mode on, the verdict says so and there is nothing
+else to look at. `floatbug` reporting zero rejections is the normal result
+for OpenAI's own models; the bug only affects some custom-provider models.
+`limits` needs the `rate_limits` snapshots that ChatGPT-plan accounts get;
+API-key accounts don't have them and the command says so.
+
 ## What each subcommand shows
 
 **`summary`** walks every rollout and prints one row per session: input and

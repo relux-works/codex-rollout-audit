@@ -166,16 +166,42 @@ def cmd_summary(args):
     if args.json:
         json.dump(rows, sys.stdout, indent=1)
         return
+    if not rows:
+        print("no rollouts found. Codex keeps them under ~/.codex/sessions/YYYY/MM/DD/*.jsonl;")
+        print("pass that directory (or wherever you archive them) as an argument.")
+        return
     total_in = sum(r["input"] for r in rows) or 1
     goal_rows = [r for r in rows if r["goal_turns"]]
     goal_in = sum(r["input"] for r in goal_rows)
-    print(f"sessions: {len(rows)}  input tokens: {total_in/1e9:.2f}B  cached: {sum(r['cached'] for r in rows)/total_in:.1%}")
-    print(f"goal sessions: {len(goal_rows)} ({len(goal_rows)/max(1,len(rows)):.1%})  their input: {goal_in/1e9:.2f}B ({goal_in/total_in:.0%} of all)")
     wait_h = sum(r["goal_wait_hours"] for r in goal_rows)
     wait_in = sum(r["goal_wait_input"] for r in goal_rows)
-    if wait_h:
-        print(f"poll-only goal turns: {sum(r['poll_only_goal_turns'] for r in goal_rows)}  hours: {wait_h:.1f}  tokens: {wait_in/1e9:.2f}B  per hour: {wait_in/wait_h/1e6:.0f}M")
-    print(f"empty goal turns: {sum(r['empty_goal_turns'] for r in goal_rows)}   float-arg rejections: {sum(r['float_errors'] for r in rows)}")
+    poll_turns = sum(r["poll_only_goal_turns"] for r in goal_rows)
+    empty_turns = sum(r["empty_goal_turns"] for r in goal_rows)
+
+    print("VERDICT")
+    print(f"  {len(rows)} sessions, {total_in/1e9:.2f}B input tokens, {sum(r['cached'] for r in rows)/total_in:.0%} of them cache hits.")
+    if not goal_rows:
+        print("  No goal-mode sessions found. The spin-wait described in the post needs an")
+        print("  active goal; without one the model ends its turn and waits for you for free.")
+    else:
+        print(f"  {len(goal_rows)} sessions ({len(goal_rows)/len(rows):.1%}) had goal mode on and used {goal_in/total_in:.0%} of all input tokens.")
+        if poll_turns:
+            print(f"  {poll_turns} goal turns did nothing but poll: {wait_h:.0f} hours, {wait_in/1e9:.2f}B tokens,")
+            print(f"  about {wait_in/max(wait_h,0.01)/1e6:.0f}M input tokens per hour of waiting.")
+            print("  For scale: waiting on a notification costs roughly 0.5M per hour at the same context.")
+        if empty_turns:
+            print(f"  {empty_turns} goal turns had no tool call at all: the model was restarted for nothing.")
+        if goal_in / total_in >= 0.3:
+            print("  This is the pattern from the post: a few goal sessions eating most of the budget.")
+        else:
+            print("  Goal mode is present but not dominant in this archive.")
+    fe = sum(r["float_errors"] for r in rows)
+    print(f"  Float-argument rejections: {fe}." + ("" if fe else " Expected for OpenAI models; see `floatbug`."))
+    print()
+    print("Columns: input = input tokens; goal = turns started by goal mode; poll = goal turns")
+    print("with only shell/wait/exec calls; empty = goal turns with no tool call; wait_h = hours")
+    print("in poll-only goal turns; M/h = million input tokens per such hour; ctx = largest")
+    print("context sent. Top sessions by input:")
     print()
     print(f"{'input':>8} {'goal':>5} {'poll':>5} {'empty':>5} {'wait_h':>6} {'M/h':>5} {'ctx':>6}  model  file")
     for r in sorted(rows, key=lambda r: -r["input"])[: args.top]:
@@ -207,6 +233,12 @@ def cmd_limits(args):
             if r.get("type") in ("response_item", "event_msg") and LIMIT_TEXT in json.dumps(p):
                 limit_hits.add((path, stamp[:16]))
     days = {k[1][:10] for k in limit_hits}
+    if not windows:
+        print("VERDICT")
+        print("  No rate_limits snapshots in these rollouts. They are attached to token_count events")
+        print("  for ChatGPT-plan accounts; API-key accounts don't get them, so this check does not")
+        print("  apply. `summary` still works for you.")
+        return
     print(f"'{LIMIT_TEXT}' events: {len(limit_hits)} on {len(days)} distinct days")
     for wm, label in ((10080, "weekly"), (300, "5-hour")):
         pts = sorted(windows[wm])
@@ -249,6 +281,15 @@ def cmd_limits(args):
             if hours:
                 hours.sort()
                 print(f"median {hours[len(hours)//2]:.0f}h, fastest {hours[0]:.0f}h, slowest {hours[-1]:.0f}h")
+            print()
+            print("VERDICT")
+            if episodes:
+                print(f"  Your weekly window reached 99% {len(episodes)} time(s) in this archive" +
+                      (f", typically {sorted(hours)[len(hours)//2]:.0f} hours after the window started." if hours else "."))
+                print("  A 7-day window emptied in about a day is the post's symptom; check `summary`")
+                print("  for goal sessions around those dates.")
+            else:
+                print("  Your weekly window never reached 99% in this archive.")
 
 
 # ---------------------------------------------------------------------- session
@@ -294,8 +335,19 @@ def cmd_floatbug(args):
             by_model[meta["model"]] += 1
             by_tool[(name, expected)] += 1
     if not by_model:
-        print("no 'invalid type: floating point' rejections found")
+        print("VERDICT")
+        print("  No 'invalid type: floating point' rejections found. That is the expected result")
+        print("  for OpenAI's own models: they send integers. The bug only shows up with some")
+        print("  custom-provider models (seen with muse-spark) that emit 60000.0 where Codex")
+        print("  expects 60000. If you never used such a model through Codex, nothing is wrong.")
+        print("  If you did, rerun with --include-backups: Codex sometimes keeps the failing turns")
+        print("  only in the *-----backup.jsonl copy.")
         return
+    print("VERDICT")
+    print(f"  {sum(by_model.values())} tool calls were rejected because the model sent a float where Codex")
+    print("  expects an integer. For those models every long-waiting primitive fails, so a single")
+    print("  shell call never lasts longer than the 10 s default yield.")
+    print()
     print("rejections by model:")
     for m, n in by_model.most_common():
         print(f"  {n:5} {m}")
