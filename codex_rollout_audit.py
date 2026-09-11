@@ -187,7 +187,7 @@ def cmd_summary(args):
 
 def cmd_limits(args):
     windows = collections.defaultdict(list)  # window_minutes -> [(t, used, resets_at)]
-    limit_msgs = collections.Counter()
+    limit_hits = set()
     for path in find_rollouts(args.roots, args.include_backups):
         for r in iter_records(path):
             p = r.get("payload") or {}
@@ -201,12 +201,13 @@ def cmd_limits(args):
                         w = rl.get(slot) or {}
                         if w.get("window_minutes") in (300, 10080) and w.get("used_percent") is not None:
                             windows[w["window_minutes"]].append((ts(stamp), w["used_percent"], w.get("resets_at")))
-            if r.get("type") == "response_item" and p.get("type") == "message":
-                if LIMIT_TEXT in json.dumps(p.get("content")):
-                    limit_msgs[stamp[:10]] += 1
-            elif r.get("type") == "event_msg" and isinstance(p.get("message"), str) and LIMIT_TEXT in p["message"]:
-                limit_msgs[stamp[:10]] += 1
-    print(f"'{LIMIT_TEXT}' messages: {sum(limit_msgs.values())} on {len(limit_msgs)} distinct days")
+            # The limit text is echoed by several record kinds for one event
+            # (tool output, item_completed, compaction summary), so count
+            # distinct minutes per file rather than raw records.
+            if r.get("type") in ("response_item", "event_msg") and LIMIT_TEXT in json.dumps(p):
+                limit_hits.add((path, stamp[:16]))
+    days = {k[1][:10] for k in limit_hits}
+    print(f"'{LIMIT_TEXT}' events: {len(limit_hits)} on {len(days)} distinct days")
     for wm, label in ((10080, "weekly"), (300, "5-hour")):
         pts = sorted(windows[wm])
         if not pts:
