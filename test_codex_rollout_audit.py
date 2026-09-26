@@ -179,6 +179,45 @@ class AuditTests(unittest.TestCase):
                          (200, 100, 100))
         self.assertAlmostEqual(rows[0]["wait_only_goal_hours"], 2 / 3600)
 
+    def test_exec_wrapper_wait_monitor_and_mixed_work(self):
+        def execute(code):
+            return record("response_item", {"type":"custom_tool_call", "name":"exec", "input":code}, 1)
+        _, turns = self.parse(context(), message("user", audit.GOAL_MARKER), execute(
+            'text(await tools.exec_command({cmd:"task-board spawn wait RUN-example"})); '
+            'text(await tools.write_stdin({session_id:123,chars:""}));'))
+        self.assertTrue(audit.is_wait_only(turns[0]))
+        self.assertEqual(turns[0]["nested_wait_calls"], 2)
+        _, turns = self.parse(context(), execute(
+            'text(await tools.exec_command({cmd:"task-board spawn status RUN-example"}));'))
+        self.assertTrue(audit.is_observation_only(turns[0]))
+        self.assertFalse(audit.is_wait_only(turns[0]))
+        _, turns = self.parse(context(), execute(
+            'text(await tools.exec_command({cmd:"task-board spawn TASK-example --background"})); '
+            'text(await tools.write_stdin({session_id:123}));'))
+        self.assertFalse(audit.is_observation_only(turns[0]))
+        self.assertEqual(turns[0]["nested_wait_calls"], 1)
+
+    def test_outer_session_metadata_survives_embedded_parent(self):
+        outer = record("session_meta", {"id":"child","forked_from_id":"parent","cwd":"/child","cli_version":"new"})
+        parent = record("session_meta", {"id":"parent","cwd":"/parent","cli_version":"old"})
+        meta, _ = self.parse(outer, parent, context())
+        self.assertEqual((meta["session_id"],meta["forked_from"],meta["cwd"],meta["cli"]),
+                         ("child","parent","/child","new"))
+        self.assertEqual(meta["usage_warnings"]["embedded_session_metadata"], 1)
+
+    def test_cli_custom_orchestrator_rules_inside_exec(self):
+        rules = Path(self.temp.name)/"rules.json"
+        rules.write_text(json.dumps({"version":1,"rules":[
+            {"kind":"wait","argv":["runner","wait","*"]}]}))
+        self.parse(context(), message("user", audit.GOAL_MARKER), record("response_item", {
+            "type":"custom_tool_call","name":"exec","input":
+            'text(await tools.exec_command({cmd:"runner wait job-1"}));'}), usage(100,100))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            audit.main(["summary",str(self.path),"--json","--rules",str(rules)])
+        row = json.loads(out.getvalue())[0]
+        self.assertEqual((row["wait_only_goal_turns"],row["goal_nested_wait_calls"],row["custom_rules"]), (1,1,1))
+
     def test_zero_usage_does_not_invent_one_token(self):
         self.parse(context())
         out = io.StringIO()

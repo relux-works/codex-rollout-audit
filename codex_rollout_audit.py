@@ -22,6 +22,8 @@ import re
 import statistics
 import sys
 
+from wait_patterns import literal_exec_calls, load_rules, observation_call
+
 GOAL_MARKER = "Continue working toward the active thread goal"
 TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens")
 LIMIT_TEXT = "hit your usage limit"
@@ -68,7 +70,9 @@ def new_turn(stamp, turn_id):
     return {"id": turn_id, "start": stamp, "end": stamp, "kind": "user", "calls": 0,
             "names": collections.Counter(), "inp": 0, "cached": 0, "out": 0,
             "ctx": 0, "cmds": collections.Counter(), "wait_calls": 0,
-            "has_text": False, "complete": False, "context_seen": False}
+            "has_text": False, "complete": False, "context_seen": False,
+            "monitor_calls": 0, "opaque_exec_calls": 0, "nested_wait_calls": 0,
+            "nested_monitor_calls": 0}
 
 
 def token_values(value):
@@ -79,43 +83,30 @@ def token_values(value):
 
 
 def waiting_call(name, args):
-    """Recognize explicit waiting attempts, never infer command intent from a shell tool name."""
-    if not isinstance(args, dict):
-        return False
-    if name.startswith("functions."):
-        name = name[len("functions."):]
-    if name == "clock.sleep":
-        return type(args.get("duration_ms")) is int and args["duration_ms"] > 0
-    if name in ("wait_agent", "collaboration.wait_agent"):
-        return True
-    if name == "wait":
-        return bool(args.get("cell_id")) and args.get("terminate", False) is False
-    if name == "write_stdin":
-        return "session_id" in args and args.get("chars", "") == ""
-    if name in ("exec_command", "shell", "shell_command"):
-        command = args.get("cmd", args.get("command", ""))
-        if isinstance(command, list):
-            if len(command) != 2 or not all(isinstance(part, str) for part in command):
-                return False
-            command = " ".join(command)
-        return isinstance(command, str) and re.fullmatch(r"\s*(?:/bin/)?sleep\s+\d+(?:\.\d+)?\s*", command) is not None
-    return False
+    return observation_call(name, args) == "wait"
 
 
-def parse_turns(path: str):
+def parse_turns(path: str, rules=()):
     """Read observed turn usage; cumulative snapshots are not individual model requests."""
     meta = {"path": path, "model": None, "provider": None, "cwd": None, "cli": None,
-            "usage_warnings": collections.Counter()}
+            "usage_warnings": collections.Counter(), "session_id": None, "forked_from": None}
     turns = []
     cur = None
     calls = {}
     float_errors = []
     previous_usage = None
+    meta_seen = False
     for r in iter_records(path):
         t = r.get("type")
         p = r.get("payload") or {}
         stamp = r.get("timestamp")
         if t == "session_meta":
+            if meta_seen:
+                meta["usage_warnings"]["embedded_session_metadata"] += 1
+                continue
+            meta_seen = True
+            meta["session_id"] = p.get("id")
+            meta["forked_from"] = p.get("forked_from_id")
             meta["provider"] = p.get("model_provider")
             meta["cwd"] = p.get("cwd")
             meta["cli"] = p.get("cli_version")
@@ -190,7 +181,21 @@ def parse_turns(path: str):
                     a = json.loads(p.get("arguments") or "{}")
                 except (json.JSONDecodeError, TypeError):
                     a = {}
-                cur["wait_calls"] += waiting_call(name, a)
+                kind = observation_call(name, a, rules)
+                if name.removeprefix("functions.") == "exec":
+                    nested = literal_exec_calls(p.get("input"))
+                    if nested is None:
+                        cur["opaque_exec_calls"] += 1
+                    else:
+                        kinds = [observation_call(n, args, rules) for n, args in nested]
+                        cur["nested_wait_calls"] += kinds.count("wait")
+                        cur["nested_monitor_calls"] += kinds.count("monitor")
+                        if all(k == "wait" for k in kinds):
+                            kind = "wait"
+                        elif all(k in ("wait", "monitor") for k in kinds):
+                            kind = "monitor"
+                cur["wait_calls"] += kind == "wait"
+                cur["monitor_calls"] += kind == "monitor"
                 if name.removeprefix("functions.") in ("exec_command", "shell", "shell_command") and isinstance(a, dict):
                     cmd = a.get("cmd") or a.get("command") or ""
                     cmd = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
@@ -213,6 +218,10 @@ def is_wait_only(turn) -> bool:
     return turn["calls"] > 0 and turn["calls"] == turn["wait_calls"]
 
 
+def is_observation_only(turn) -> bool:
+    return turn["calls"] > 0 and turn["calls"] == turn["wait_calls"] + turn["monitor_calls"]
+
+
 def duration(turn) -> float:
     try:
         return max(0, ts(turn["end"]) - ts(turn["start"]))
@@ -225,7 +234,7 @@ def duration(turn) -> float:
 def cmd_summary(args):
     rows = []
     for path in find_rollouts(args.roots, args.include_backups):
-        meta, turns = parse_turns(path)
+        meta, turns = parse_turns(path, args.rules)
         if not turns:
             continue
         goal = [t for t in turns if t["kind"] == "goal"]
@@ -233,7 +242,15 @@ def cmd_summary(args):
         no_tools = [t for t in goal if t["calls"] == 0]
         rows.append({
             "schema_version": 2,
+            "custom_rules": len(args.rules),
             "file": os.path.basename(path),
+            "session_id": meta["session_id"], "forked_from": meta["forked_from"],
+            "observation_only_goal_turns": sum(is_observation_only(t) for t in goal),
+            "goal_wait_calls": sum(t["wait_calls"] for t in goal),
+            "goal_monitor_calls": sum(t["monitor_calls"] for t in goal),
+            "goal_opaque_exec_calls": sum(t["opaque_exec_calls"] for t in goal),
+            "goal_nested_wait_calls": sum(t["nested_wait_calls"] for t in goal),
+            "goal_nested_monitor_calls": sum(t["nested_monitor_calls"] for t in goal),
             "model": meta["model"], "provider": meta["provider"],
             "turns": len(turns), "goal_turns": len(goal),
             "wait_only_goal_turns": len(waiting), "no_tool_goal_turns": len(no_tools),
@@ -277,6 +294,18 @@ def cmd_summary(args):
             if wait_h:
                 print(f"  {wait_in/wait_h/1e6:.1f}M input tokens per hour across those turns.")
         print(f"  {no_tool_turns} goal turns made no tool calls; this alone does not establish lack of progress.")
+    if args.rules:
+        print(f"  Classification uses {len(args.rules)} user-supplied rules; their semantics are not independently verified.")
+    forks = sum(bool(r["forked_from"]) for r in rows)
+    if forks:
+        print(f"  WARNING: {forks} fork files may repeat parent usage and goal turns. Archive totals are not deduplicated.")
+    if goal_rows:
+        observed = sum(r["observation_only_goal_turns"] for r in goal_rows)
+        opaque = sum(r["goal_opaque_exec_calls"] for r in goal_rows)
+        print(f"  {observed} goal turns used only recognized waits/status observations (includes wait-only); {opaque} exec scripts remain opaque.")
+        nested_waits = sum(r["goal_nested_wait_calls"] for r in goal_rows)
+        nested_monitors = sum(r["goal_nested_monitor_calls"] for r in goal_rows)
+        print(f"  Inside parsed exec scripts: {nested_waits} waiting calls, {nested_monitors} monitoring calls, including mixed work turns.")
     print("  Waiting calls may return useful results or errors. These totals are not a measurement of waste or subscription charges.")
     warnings = collections.Counter()
     for row in rows:
@@ -382,7 +411,10 @@ def cmd_limits(args):
 # ---------------------------------------------------------------------- session
 
 def cmd_session(args):
-    meta, turns = parse_turns(args.file)
+    meta, turns = parse_turns(args.file, args.rules)
+    if args.rules:
+        print(f"custom_rules={len(args.rules)} (user-supplied semantics)")
+    print(f"session={meta['session_id']} forked_from={meta['forked_from']}")
     print(f"model={meta['model']} provider={meta['provider']} cli={meta['cli']} turns={len(turns)} goal={sum(1 for t in turns if t['kind']=='goal')}")
     prev_end = None
     print(f"{'#':>3} {'start':16} {'kind':4} {'gap_s':>6} {'dur_s':>6} {'calls':>5} {'in_M':>6} {'ctx_K':>6}  top tools / commands")
@@ -405,6 +437,7 @@ def cmd_session(args):
             gaps.sort()
             print(f"\ngap before goal continuations: median {statistics.median(gaps):.2f}s, min {gaps[0]:.2f}s, max {gaps[-1]:.2f}s")
         waiting = [t for t in goal if is_wait_only(t)]
+        print(f"inside parsed goal exec scripts: waits={sum(t['nested_wait_calls'] for t in goal)}, monitoring={sum(t['nested_monitor_calls'] for t in goal)}, opaque exec scripts={sum(t['opaque_exec_calls'] for t in goal)}")
         print(f"goal turns {len(goal)}, recognized wait-only {len(waiting)}, no tools {sum(1 for t in goal if t['calls']==0)}, observed input in goal turns {sum(t['inp'] for t in goal)/1e6:.0f}M")
     if any(meta["usage_warnings"].values()):
         print("usage accounting caveats:", dict(meta["usage_warnings"]))
@@ -450,12 +483,18 @@ def main(argv=None):
         if name == "summary":
             s.add_argument("--top", type=int, default=15)
             s.add_argument("--json", action="store_true")
+            s.add_argument("--rules", help="JSON file defining additional CLI/tool wait and monitor rules")
         s.set_defaults(fn=fn)
     s = sub.add_parser("session")
     s.add_argument("file")
     s.add_argument("--commands", action="store_true", help="show the most repeated shell command per turn")
+    s.add_argument("--rules", help="JSON file defining additional CLI/tool wait and monitor rules")
     s.set_defaults(fn=cmd_session)
     args = ap.parse_args(argv)
+    try:
+        args.rules = load_rules(getattr(args, "rules", None))
+    except (OSError, ValueError) as error:
+        ap.error(str(error))
     args.fn(args)
 
 

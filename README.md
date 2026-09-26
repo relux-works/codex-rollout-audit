@@ -5,7 +5,7 @@ quota snapshots, and rejected numeric arguments. Background:
 [goal-mode token burn](https://relux.works/en/blog/codex-goal-token-burn/)
 ([русская версия](https://relux.works/ru/blog/codex-goal-token-burn/)).
 
-One Python script, standard library only, Python 3.9+. Reads local files;
+Python CLI with a small recognition module, standard library only, Python 3.9+. Reads local files;
 does not upload data or modify rollouts. Works on Linux, macOS, and Windows.
 
 ## Tools and commands
@@ -30,7 +30,15 @@ GitHub Actions runs the same tests; its output is in the workflow logs.
 defaulting to `~/.codex/sessions`. Overlapping paths and symlinks to the same
 file are read once. Backup files are excluded unless `--include-backups` is
 set. Separate copies or inherited histories in forked files are not deduplicated;
-select a nonoverlapping archive for aggregate totals.
+select a nonoverlapping archive for aggregate totals. JSON identifies `session_id`
+and `forked_from`; text reports warn when forks are present. The first session
+metadata record owns the file, even when a fork embeds parent metadata later.
+A fork's continuation prompts may be inherited: their presence does not prove
+that the child activated its own goal. Timestamps can also be rewritten on fork.
+
+Managed orchestrators may store rollouts in private `CODEX_HOME` directories.
+Pass those rollout directories explicitly; the default scans only `~/.codex/sessions`.
+Do not add both a copied history and its original to a usage aggregate.
 
 ## Reading the results
 
@@ -50,13 +58,77 @@ select a nonoverlapping archive for aggregate totals.
 
 Recognized waits are `clock.sleep`, `wait_agent`, nonterminating `wait`,
 empty-input `write_stdin`, and a simple shell `sleep NUMBER` command. Supported
-namespaces are recognized too. Calls can return results or errors; classification
-does not establish that a process was live, a wait succeeded, or tokens were wasted.
+namespaces are recognized too. The built-in task-board profile recognizes
+`spawn wait/observe/watch` as waits, and `spawn status/events` as monitoring
+(`events --follow` is a wait). Launching an agent and sending directives are
+unclassified work. Shell pipelines, compound commands and expansions fail closed.
+Calls may return useful results or errors: classification does not prove that a
+wait succeeded, a child was still running, or any tokens were wasted.
 
-Arbitrary shell commands, `tail`, `ls`, `gh`, code-mode `exec`, compound shell
-commands, and `update_plan` are unclassified. This deliberately misses some real
-polling rather than labeling builds, edits, or analysis as waiting. Inspect a
-session with `--commands` to investigate such turns; no shell command is executed.
+Code-mode `exec` is inspected without executing it. Only entire scripts made of
+literal `text(await tools.NAME({...}));` statements or
+`const r = await tools.NAME({...}); text(r.output);` (also `let`, `text(r)`) are
+recognized. Flat literal arguments, multiple statements and a leading `@exec`
+pragma are supported. Variables in arguments, loops, arbitrary expressions,
+`Promise.all`, and other JavaScript remain opaque. A mixed script containing
+an agent launch or build never becomes wait-only just because it also waits.
+
+Additional JSON fields expose coverage:
+
+- `observation_only_goal_turns`: turns containing only recognized waits and
+  monitoring calls; includes `wait_only_goal_turns`. Monitoring-only/mixed
+  observation turns remain in the existing `unclassified_goal_turns` field.
+- `goal_wait_calls`, `goal_monitor_calls`: outer tool calls classified as waits
+  or observations (an entirely recognized exec wrapper counts once).
+- `goal_nested_wait_calls`, `goal_nested_monitor_calls`: recognized calls inside
+  fully parsed exec scripts, including scripts that also do work. These overlap
+  with the outer counters; **do not add them together**.
+- `goal_opaque_exec_calls`: exec scripts outside the accepted grammar. A parsed
+  script may still contain commands whose intent is unknown.
+
+Per-call counters identify waiting inside productive turns. They do not assign
+input tokens to individual calls. `tail`, arbitrary `gh` commands, board queries,
+and unrecognized tools remain unclassified. Inspect `session --commands` when
+appropriate; command display covers direct shell calls only.
+
+## Other orchestrators
+
+Tool/exec parsing does not depend on task-board. Add CLI or MCP semantics with
+an optional declarative file, without changing Python code:
+
+```json
+{
+  "version": 1,
+  "rules": [
+    {"kind": "wait", "argv": ["runner", "jobs", "wait", "*", "--timeout", "*"]},
+    {"kind": "monitor", "argv": ["runner", "jobs", "status", "*"]},
+    {"kind": "wait", "tool": "mcp__runner__await_job", "arguments": {"cancel": false}}
+  ]
+}
+```
+
+```bash
+python3 codex_rollout_audit.py summary /path/to/rollouts --rules rules.json --json
+python3 codex_rollout_audit.py session /path/to/rollout.jsonl --rules rules.json
+```
+
+`argv` matches the **entire** tokenized simple command; `*` matches exactly one
+argument. Specify separate rules for optional flags and full executable paths.
+Tool rules match a name and any required literal arguments (including nested
+JSON values, with type-sensitive equality); omitted constraints
+mean every call of that tool. Rules apply to direct calls and recognized exec
+wrappers. Direct `namespace.name` and code-mode `namespace__name` tool names
+are normalized consistently. Conflicting matching kinds stay unclassified. Matching custom rules
+precede built-ins. Tool rules cannot override `exec` or shell wrappers; use
+`argv` rules for their commands. Shell compounds/expansions are rejected even
+with custom rules.
+
+Rules are user-supplied semantic assumptions, not independently verified facts;
+JSON reports their count as `custom_rules`, and text reports disclose their use.
+No configuration can prove that a read was useless. Configure only operations
+whose meaning you know, and retain the rules alongside reports for reproducibility.
+
+## Goal and quota interpretation
 
 Goal detection recognizes the continuation prompt at the beginning of a user
 message, including native `codex_internal_context source="goal"` and legacy
@@ -118,6 +190,7 @@ Rollouts can contain prompts, file contents, commands and credentials. Default
 reports print counts, filenames, model/provider and tool names. `--commands`
 also prints command prefixes, which may contain secrets; review before sharing.
 
-The parser targets CLI 0.144–0.154 record shapes and newer compatible lifecycle
-records. Regression tests use synthetic data. For an unsupported shape, open an
+The parser targets CLI 0.143–0.154 record shapes and newer compatible lifecycle
+records. Regression tests use synthetic data, including shapes observed in local
+rollouts; private rollout contents are not included. For an unsupported shape, open an
 issue with a redacted example. MIT license.
