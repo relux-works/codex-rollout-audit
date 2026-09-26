@@ -5,15 +5,13 @@ Everything runs locally on the rollout files under ~/.codex/sessions.
 Nothing is uploaded. Python 3.9+, standard library only.
 
 Subcommands:
-  summary   per-session table: goal turns, poll-only goal turns, tokens
+  summary   per-session table: goal turns, recognized waits, observed tokens
   limits    weekly / 5-hour limit exhaustion episodes from rate_limits snapshots
   session   per-turn timeline of one rollout file (goal continuations, gaps)
   floatbug  tool calls rejected with "invalid type: floating point"
 
 Background: https://relux.works/en/blog/codex-goal-token-burn/
 """
-from __future__ import annotations
-
 import argparse
 import collections
 import datetime as dt
@@ -21,11 +19,11 @@ import glob
 import json
 import os
 import re
+import statistics
 import sys
 
 GOAL_MARKER = "Continue working toward the active thread goal"
-SHELL_TOOLS = {"exec_command", "shell", "shell_command", "write_stdin", "wait", "exec"}
-POLL_TOOLS = SHELL_TOOLS | {"update_plan"}
+TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens")
 LIMIT_TEXT = "hit your usage limit"
 FLOAT_ERR = re.compile(r"invalid type: floating point `?([0-9.]+)`?, expected (\w+)")
 
@@ -39,7 +37,7 @@ def fmt_ts(t: float) -> str:
 
 
 def iter_records(path: str):
-    with open(path, errors="replace") as f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             try:
                 yield json.loads(line)
@@ -50,26 +48,69 @@ def iter_records(path: str):
 def find_rollouts(roots, include_backups=False):
     """Yield rollout files. Codex writes `...-----backup.jsonl` copies next to
     some rollouts; they duplicate the main file and are skipped unless asked."""
+    seen = set()
     for root in roots:
         root = os.path.expanduser(root)
-        if os.path.isfile(root):
-            yield root
-            continue
-        for p in sorted(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True)):
+        paths = [root] if os.path.isfile(root) else sorted(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True))
+        for p in paths:
             if "backup" in os.path.basename(p) and not include_backups:
                 continue
+            identity = os.path.realpath(p)
+            if identity in seen:
+                continue
+            seen.add(identity)
             yield p
 
 
 # ---------------------------------------------------------------- per-turn parse
 
+def new_turn(stamp, turn_id):
+    return {"id": turn_id, "start": stamp, "end": stamp, "kind": "user", "calls": 0,
+            "names": collections.Counter(), "inp": 0, "cached": 0, "out": 0,
+            "ctx": 0, "cmds": collections.Counter(), "wait_calls": 0,
+            "has_text": False, "complete": False, "context_seen": False}
+
+
+def token_values(value):
+    if not isinstance(value, dict) or "input_tokens" not in value or "output_tokens" not in value:
+        return None
+    values = tuple(value.get(key, 0) for key in TOKEN_FIELDS)
+    return values if all(type(n) is int and n >= 0 for n in values) else None
+
+
+def waiting_call(name, args):
+    """Recognize explicit waiting attempts, never infer command intent from a shell tool name."""
+    if not isinstance(args, dict):
+        return False
+    if name.startswith("functions."):
+        name = name[len("functions."):]
+    if name == "clock.sleep":
+        return type(args.get("duration_ms")) is int and args["duration_ms"] > 0
+    if name in ("wait_agent", "collaboration.wait_agent"):
+        return True
+    if name == "wait":
+        return bool(args.get("cell_id")) and args.get("terminate", False) is False
+    if name == "write_stdin":
+        return "session_id" in args and args.get("chars", "") == ""
+    if name in ("exec_command", "shell", "shell_command"):
+        command = args.get("cmd", args.get("command", ""))
+        if isinstance(command, list):
+            if len(command) != 2 or not all(isinstance(part, str) for part in command):
+                return False
+            command = " ".join(command)
+        return isinstance(command, str) and re.fullmatch(r"\s*(?:/bin/)?sleep\s+\d+(?:\.\d+)?\s*", command) is not None
+    return False
+
+
 def parse_turns(path: str):
-    """Return (meta, turns). Each turn: dict(start, end, kind, calls, names, inp, cached, out, ctx, cmds)."""
-    meta = {"path": path, "model": None, "provider": None, "cwd": None, "cli": None}
+    """Read observed turn usage; cumulative snapshots are not individual model requests."""
+    meta = {"path": path, "model": None, "provider": None, "cwd": None, "cli": None,
+            "usage_warnings": collections.Counter()}
     turns = []
     cur = None
     calls = {}
     float_errors = []
+    previous_usage = None
     for r in iter_records(path):
         t = r.get("type")
         p = r.get("payload") or {}
@@ -79,45 +120,85 @@ def parse_turns(path: str):
             meta["cwd"] = p.get("cwd")
             meta["cli"] = p.get("cli_version")
             continue
-        if t == "turn_context":
+        if t == "turn_context" or (t == "event_msg" and p.get("type") == "task_started"):
+            turn_id = p.get("turn_id")
+            if (cur is None or cur["complete"] or (turn_id and cur["id"] and turn_id != cur["id"])
+                    or (t == "turn_context" and not turn_id and cur["context_seen"])):
+                cur = new_turn(stamp, turn_id)
+                turns.append(cur)
+            elif t == "event_msg":
+                cur["start"] = stamp
+            cur["id"] = turn_id or cur["id"]
             meta["model"] = p.get("model") or meta["model"]
-            cur = {"start": stamp, "end": stamp, "kind": "user", "calls": 0,
-                   "names": collections.Counter(), "inp": 0, "cached": 0, "out": 0,
-                   "ctx": 0, "cmds": collections.Counter(), "model_calls": 0}
-            turns.append(cur)
+            cur["context_seen"] |= t == "turn_context"
+            continue
+        if t == "event_msg" and p.get("type") == "token_count":
+            info = p.get("info") or {}
+            total = token_values(info.get("total_token_usage"))
+            last = token_values(info.get("last_token_usage"))
+            if total is None:
+                if info:
+                    meta["usage_warnings"]["missing_totals"] += 1
+                continue
+            reset = previous_usage is not None and any(a < b for a, b in zip(total, previous_usage))
+            if previous_usage is None or reset:
+                delta = tuple(min(a, b) for a, b in zip(total, last)) if last and cur is not None else (0, 0, 0)
+                meta["usage_warnings"]["baseline_input_excluded"] += total[0] - delta[0]
+                if reset:
+                    meta["usage_warnings"]["counter_resets"] += 1
+                if last is None:
+                    meta["usage_warnings"]["missing_initial_usage"] += 1
+            else:
+                delta = tuple(a - b for a, b in zip(total, previous_usage))
+            previous_usage = total
+            if cur is not None:
+                cur["inp"] += delta[0]
+                cur["cached"] += delta[1]
+                cur["out"] += delta[2]
+                if delta[0] and last:
+                    cur["ctx"] = max(cur["ctx"], last[0])
+                if stamp and not cur["complete"]:
+                    cur["end"] = stamp
             continue
         if cur is None:
             continue
-        if stamp and (t == "response_item" or (t == "event_msg" and p.get("type") == "token_count")):
+        if t == "event_msg" and p.get("type") in ("task_complete", "turn_aborted"):
+            if p.get("turn_id") in (None, cur["id"]):
+                cur["end"] = stamp
+                cur["complete"] = True
+                cur["has_text"] |= bool(p.get("last_agent_message"))
+            continue
+        if stamp and t == "response_item" and not cur["complete"]:
             cur["end"] = stamp
-        if t == "event_msg" and p.get("type") == "token_count":
-            last = ((p.get("info") or {}).get("last_token_usage") or {})
-            i = last.get("input_tokens") or 0
-            if i:
-                cur["model_calls"] += 1
-            cur["inp"] += i
-            cur["cached"] += last.get("cached_input_tokens") or 0
-            cur["out"] += last.get("output_tokens") or 0
-            cur["ctx"] = max(cur["ctx"], i)
-        elif t == "response_item":
+        if t == "response_item":
             pt = p.get("type")
-            if pt == "message" and p.get("role") == "user":
-                txt = json.dumps(p.get("content"))
-                if GOAL_MARKER in txt:
+            if pt == "message":
+                txt = "\n".join(part.get("text", "") for part in (p.get("content") or []) if isinstance(part, dict))
+                goal_text = re.sub(r'^(?:<goal_context>|<codex_internal_context source="goal">)\s*', '', txt.strip())
+                if p.get("role") == "user" and goal_text.startswith(GOAL_MARKER):
                     cur["kind"] = "goal"
+                if p.get("role") == "assistant":
+                    cur["has_text"] |= bool(txt.strip())
             elif pt in ("function_call", "custom_tool_call"):
-                name = p.get("name")
+                name = p.get("name") or "unknown"
+                if p.get("namespace"):
+                    name = f"{p['namespace']}.{name}"
                 cur["calls"] += 1
                 cur["names"][name] += 1
                 calls[p.get("call_id")] = name
-                if name in ("exec_command", "shell", "shell_command"):
-                    try:
-                        a = json.loads(p.get("arguments") or "{}")
-                    except json.JSONDecodeError:
-                        a = {}
+                try:
+                    a = json.loads(p.get("arguments") or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    a = {}
+                cur["wait_calls"] += waiting_call(name, a)
+                if name.removeprefix("functions.") in ("exec_command", "shell", "shell_command") and isinstance(a, dict):
                     cmd = a.get("cmd") or a.get("command") or ""
                     cmd = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
                     cur["cmds"][re.sub(r"\s+", " ", cmd)[:60]] += 1
+            elif isinstance(pt, str) and pt.endswith("_call"):
+                # Native calls (web search, computer, image generation, etc.) are work too.
+                cur["calls"] += 1
+                cur["names"][pt] += 1
             elif pt in ("function_call_output", "custom_tool_call_output"):
                 out = p.get("output")
                 s = out if isinstance(out, str) else json.dumps(out)
@@ -128,13 +209,13 @@ def parse_turns(path: str):
     return meta, turns
 
 
-def is_poll_only(turn) -> bool:
-    return turn["calls"] > 0 and set(turn["names"]) <= POLL_TOOLS
+def is_wait_only(turn) -> bool:
+    return turn["calls"] > 0 and turn["calls"] == turn["wait_calls"]
 
 
 def duration(turn) -> float:
     try:
-        return ts(turn["end"]) - ts(turn["start"])
+        return max(0, ts(turn["end"]) - ts(turn["start"]))
     except (TypeError, ValueError):
         return 0.0
 
@@ -148,20 +229,25 @@ def cmd_summary(args):
         if not turns:
             continue
         goal = [t for t in turns if t["kind"] == "goal"]
-        poll = [t for t in goal if is_poll_only(t)]
-        empty = [t for t in goal if t["calls"] == 0]
+        waiting = [t for t in goal if is_wait_only(t)]
+        no_tools = [t for t in goal if t["calls"] == 0]
         rows.append({
+            "schema_version": 2,
             "file": os.path.basename(path),
             "model": meta["model"], "provider": meta["provider"],
             "turns": len(turns), "goal_turns": len(goal),
-            "poll_only_goal_turns": len(poll), "empty_goal_turns": len(empty),
-            "goal_wait_hours": round(sum(duration(t) for t in poll) / 3600, 1),
-            "goal_wait_input": sum(t["inp"] for t in poll),
+            "wait_only_goal_turns": len(waiting), "no_tool_goal_turns": len(no_tools),
+            "unclassified_goal_turns": len(goal) - len(waiting) - len(no_tools),
+            "wait_only_goal_hours": sum(duration(t) for t in waiting) / 3600,
+            "wait_only_goal_input": sum(t["inp"] for t in waiting),
+            "no_tool_goal_input": sum(t["inp"] for t in no_tools),
+            "goal_input": sum(t["inp"] for t in goal),
             "input": sum(t["inp"] for t in turns),
             "cached": sum(t["cached"] for t in turns),
             "output": sum(t["out"] for t in turns),
             "max_context": max(t["ctx"] for t in turns),
             "float_errors": len(meta["float_errors"]),
+            "usage_warnings": dict(meta["usage_warnings"]),
         })
     if args.json:
         json.dump(rows, sys.stdout, indent=1)
@@ -170,43 +256,44 @@ def cmd_summary(args):
         print("no rollouts found. Codex keeps them under ~/.codex/sessions/YYYY/MM/DD/*.jsonl;")
         print("pass that directory (or wherever you archive them) as an argument.")
         return
-    total_in = sum(r["input"] for r in rows) or 1
+    total_in = sum(r["input"] for r in rows)
     goal_rows = [r for r in rows if r["goal_turns"]]
-    goal_in = sum(r["input"] for r in goal_rows)
-    wait_h = sum(r["goal_wait_hours"] for r in goal_rows)
-    wait_in = sum(r["goal_wait_input"] for r in goal_rows)
-    poll_turns = sum(r["poll_only_goal_turns"] for r in goal_rows)
-    empty_turns = sum(r["empty_goal_turns"] for r in goal_rows)
+    goal_session_in = sum(r["input"] for r in goal_rows)
+    goal_in = sum(r["goal_input"] for r in goal_rows)
+    wait_h = sum(r["wait_only_goal_hours"] for r in goal_rows)
+    wait_in = sum(r["wait_only_goal_input"] for r in goal_rows)
+    wait_turns = sum(r["wait_only_goal_turns"] for r in goal_rows)
+    no_tool_turns = sum(r["no_tool_goal_turns"] for r in goal_rows)
 
     print("VERDICT")
-    print(f"  {len(rows)} sessions, {total_in/1e9:.2f}B input tokens, {sum(r['cached'] for r in rows)/total_in:.0%} of them cache hits.")
+    print(f"  {len(rows)} rollout files, {total_in/1e9:.2f}B observed input tokens, {sum(r['cached'] for r in rows)/max(total_in,1):.0%} cached.")
     if not goal_rows:
-        print("  No goal-mode sessions found. The spin-wait described in the post needs an")
-        print("  active goal; without one the model ends its turn and waits for you for free.")
+        print("  No goal continuation prompts recognized in these rollouts.")
     else:
-        print(f"  {len(goal_rows)} sessions ({len(goal_rows)/len(rows):.1%}) had goal mode on and used {goal_in/total_in:.0%} of all input tokens.")
-        if poll_turns:
-            print(f"  {poll_turns} goal turns did nothing but poll: {wait_h:.0f} hours, {wait_in/1e9:.2f}B tokens,")
-            print(f"  about {wait_in/max(wait_h,0.01)/1e6:.0f}M input tokens per hour of waiting.")
-            print("  For scale: waiting on a notification costs roughly 0.5M per hour at the same context.")
-        if empty_turns:
-            print(f"  {empty_turns} goal turns had no tool call at all: the model was restarted for nothing.")
-        if goal_in / total_in >= 0.3:
-            print("  This is the pattern from the post: a few goal sessions eating most of the budget.")
-        else:
-            print("  Goal mode is present but not dominant in this archive.")
+        print(f"  {len(goal_rows)} files contain goal continuations; their entire sessions used {goal_session_in/max(total_in,1):.0%} of observed input.")
+        print(f"  Goal continuation turns themselves used {goal_in/1e9:.2f}B input tokens.")
+        if wait_turns:
+            print(f"  {wait_turns} goal turns used only recognized waiting calls: {wait_h:.3f} turn-hours, {wait_in/1e9:.3f}B input tokens.")
+            if wait_h:
+                print(f"  {wait_in/wait_h/1e6:.1f}M input tokens per hour across those turns.")
+        print(f"  {no_tool_turns} goal turns made no tool calls; this alone does not establish lack of progress.")
+    print("  Waiting calls may return useful results or errors. These totals are not a measurement of waste or subscription charges.")
+    warnings = collections.Counter()
+    for row in rows:
+        warnings.update(row["usage_warnings"])
+    if any(warnings.values()):
+        print(f"  Usage accounting caveats: {dict(warnings)}. See README for coverage limits.")
     fe = sum(r["float_errors"] for r in rows)
-    print(f"  Float-argument rejections: {fe}." + ("" if fe else " Expected for OpenAI models; see `floatbug`."))
+    print(f"  Float-argument rejections: {fe}.")
     print()
-    print("Columns: input = input tokens; goal = turns started by goal mode; poll = goal turns")
-    print("with only shell/wait/exec calls; empty = goal turns with no tool call; wait_h = hours")
-    print("in poll-only goal turns; M/h = million input tokens per such hour; ctx = largest")
-    print("context sent. Top sessions by input:")
+    print("Columns: wait = recognized wait-only goal turns; none = no-tool goal turns;")
+    print("other = unclassified goal turns; hours = whole wait-only turn durations, not measured sleep time;")
+    print("M/h = input per such hour; ctx = largest reported last input. Top files by input:")
     print()
-    print(f"{'input':>8} {'goal':>5} {'poll':>5} {'empty':>5} {'wait_h':>6} {'M/h':>5} {'ctx':>6}  model  file")
+    print(f"{'input':>8} {'goal':>5} {'wait':>5} {'none':>5} {'other':>5} {'hours':>7} {'M/h':>7} {'ctx':>6}  model  file")
     for r in sorted(rows, key=lambda r: -r["input"])[: args.top]:
-        mph = r["goal_wait_input"] / r["goal_wait_hours"] / 1e6 if r["goal_wait_hours"] else 0
-        print(f"{r['input']/1e9:7.2f}B {r['goal_turns']:5} {r['poll_only_goal_turns']:5} {r['empty_goal_turns']:5} {r['goal_wait_hours']:6.1f} {mph:5.0f} {r['max_context']/1e3:5.0f}K  {r['model']}  {r['file'][8:27]}")
+        mph = r["wait_only_goal_input"] / r["wait_only_goal_hours"] / 1e6 if r["wait_only_goal_hours"] else 0
+        print(f"{r['input']/1e9:7.2f}B {r['goal_turns']:5} {r['wait_only_goal_turns']:5} {r['no_tool_goal_turns']:5} {r['unclassified_goal_turns']:5} {r['wait_only_goal_hours']:7.3f} {mph:7.1f} {r['max_context']/1e3:5.0f}K  {r['model']}  {r['file'][8:27]}")
 
 
 # ----------------------------------------------------------------------- limits
@@ -280,12 +367,12 @@ def cmd_limits(args):
                     print(f"  window {fmt_ts(start)}: {h:.1f}h")
             if hours:
                 hours.sort()
-                print(f"median {hours[len(hours)//2]:.0f}h, fastest {hours[0]:.0f}h, slowest {hours[-1]:.0f}h")
+                print(f"median {statistics.median(hours):.0f}h, fastest {hours[0]:.0f}h, slowest {hours[-1]:.0f}h")
             print()
             print("VERDICT")
             if episodes:
                 print(f"  Your weekly window reached 99% {len(episodes)} time(s) in this archive" +
-                      (f", typically {sorted(hours)[len(hours)//2]:.0f} hours after the window started." if hours else "."))
+                      (f", typically {statistics.median(hours):.0f} hours after the window started." if hours else "."))
                 print("  A 7-day window emptied in about a day is the post's symptom; check `summary`")
                 print("  for goal sessions around those dates.")
             else:
@@ -316,9 +403,11 @@ def cmd_session(args):
             prev_end = t["end"]
         if gaps:
             gaps.sort()
-            print(f"\ngap before goal continuations: median {gaps[len(gaps)//2]:.2f}s, min {gaps[0]:.2f}s, max {gaps[-1]:.2f}s")
-        poll = [t for t in goal if is_poll_only(t)]
-        print(f"goal turns {len(goal)}, poll-only {len(poll)}, empty {sum(1 for t in goal if t['calls']==0)}, input in goal turns {sum(t['inp'] for t in goal)/1e6:.0f}M")
+            print(f"\ngap before goal continuations: median {statistics.median(gaps):.2f}s, min {gaps[0]:.2f}s, max {gaps[-1]:.2f}s")
+        waiting = [t for t in goal if is_wait_only(t)]
+        print(f"goal turns {len(goal)}, recognized wait-only {len(waiting)}, no tools {sum(1 for t in goal if t['calls']==0)}, observed input in goal turns {sum(t['inp'] for t in goal)/1e6:.0f}M")
+    if any(meta["usage_warnings"].values()):
+        print("usage accounting caveats:", dict(meta["usage_warnings"]))
     if meta["float_errors"]:
         c = collections.Counter((n, e) for n, _, e in meta["float_errors"])
         print("float-arg rejections:", dict(c))
@@ -336,17 +425,11 @@ def cmd_floatbug(args):
             by_tool[(name, expected)] += 1
     if not by_model:
         print("VERDICT")
-        print("  No 'invalid type: floating point' rejections found. That is the expected result")
-        print("  for OpenAI's own models: they send integers. The bug only shows up with some")
-        print("  custom-provider models (seen with muse-spark) that emit 60000.0 where Codex")
-        print("  expects 60000. If you never used such a model through Codex, nothing is wrong.")
-        print("  If you did, rerun with --include-backups: Codex sometimes keeps the failing turns")
-        print("  only in the *-----backup.jsonl copy.")
+        print("  No 'invalid type: floating point' rejections found in the selected rollouts.")
         return
     print("VERDICT")
     print(f"  {sum(by_model.values())} tool calls were rejected because the model sent a float where Codex")
-    print("  expects an integer. For those models every long-waiting primitive fails, so a single")
-    print("  shell call never lasts longer than the 10 s default yield.")
+    print("  expects an integer. This count does not establish that other calls or all waiting tools failed.")
     print()
     print("rejections by model:")
     for m, n in by_model.most_common():
